@@ -618,6 +618,34 @@ def main():
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
+    # Gradient accumulation (single-GPU substitute for multi-GPU data parallelism):
+    # the collated batch of `batch_size_training` samples is split into
+    # `grad_accum_steps` micro-batches, each micro-batch loss is scaled by
+    # 1/grad_accum_steps, and the optimizer steps once per full batch.
+    grad_accum_steps = max(1, int(getattr(configs, "grad_accum_steps", 1)))
+    if rank == 0 and grad_accum_steps > 1:
+        print(
+            f"Gradient accumulation: {grad_accum_steps} micro-batches of "
+            f"{configs.batch_size_training // grad_accum_steps} per optimizer step "
+            f"(effective batch {configs.batch_size_training * world_size})"
+        )
+
+    def _split_micro_batches(batch, n_splits):
+        """Split every batch-major tensor in `batch` into `n_splits` chunks along dim 0."""
+        if n_splits <= 1:
+            return [batch]
+        bsz = batch["input_ids"].shape[0]
+        bounds = [(i * bsz) // n_splits for i in range(n_splits + 1)]
+        out = []
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            if hi <= lo:
+                continue
+            out.append({
+                k: (v[lo:hi] if isinstance(v, torch.Tensor) and v.dim() > 0 and v.shape[0] == bsz else v)
+                for k, v in batch.items()
+            })
+        return out
+
     def _make_loader(dataset, batch_size, sampler):
         # Shared DataLoader construction: num_workers/pin_memory/collate_fn are
         # identical across the train + eval loaders; shuffle is sampler-driven.
@@ -797,109 +825,126 @@ def main():
                     key: batch[key].to(rank) for key in batch.keys() if key not in ["idx", "answer_labels"]
                 }
 
-                # Add n_looped_iters parameter if using Lotus
-                if use_looped:
-                    # Use max of sample_stages if available (cumulative mode), else scheduled_stage
-                    if "sample_stages" in batch:
-                        batch["n_looped_iters"] = batch["sample_stages"].max().item()
+                # Split into micro-batches for gradient accumulation (1 = no-op).
+                micro_batches = _split_micro_batches(batch, grad_accum_steps)
+                n_micro = len(micro_batches)
+                loss_accum = 0.0
+                _comp_accum = {}
+                for _mb_idx, batch in enumerate(micro_batches):
+                    # Add n_looped_iters parameter if using Lotus
+                    if use_looped:
+                        # Use max of sample_stages if available (cumulative mode), else scheduled_stage
+                        if "sample_stages" in batch:
+                            batch["n_looped_iters"] = batch["sample_stages"].max().item()
+                        else:
+                            batch["n_looped_iters"] = scheduled_stage
+
+                    # For CoT with FSDP, don't pass labels to HF model — we compute
+                    # CE from logits ourselves, so avoid paying for it twice.
+                    if not configs.looped and dist.is_initialized():
+                        train_labels = batch.pop("labels")
                     else:
-                        batch["n_looped_iters"] = scheduled_stage
+                        train_labels = None
 
-                # For CoT with FSDP, don't pass labels to HF model — we compute
-                # CE from logits ourselves, so avoid paying for it twice.
-                if not configs.looped and dist.is_initialized():
-                    train_labels = batch.pop("labels")
-                else:
-                    train_labels = None
+                    outputs = parallel_model(**batch)
 
-                outputs = parallel_model(**batch)
+                    # ── FSDP-correct loss normalization ──────────────────────────────
+                    # Models return raw loss_sum (CE with reduction='sum') and n_valid
+                    # counts.  We normalize here, OUTSIDE the FSDP-wrapped forward, so
+                    # the all_reduce doesn't create a sync-point that breaks FSDP's
+                    # overlapped communication.
+                    #
+                    # Formula: loss = (W * loss_sum) / n_global
+                    #   where n_global = all_reduce(n_local) and W = world_size.
+                    # FSDP backward divides grad by W, yielding grad(loss_sum)/n_global
+                    # which is the correct per-token gradient.
 
-                # ── FSDP-correct loss normalization ──────────────────────────────
-                # Models return raw loss_sum (CE with reduction='sum') and n_valid
-                # counts.  We normalize here, OUTSIDE the FSDP-wrapped forward, so
-                # the all_reduce doesn't create a sync-point that breaks FSDP's
-                # overlapped communication.
-                #
-                # Formula: loss = (W * loss_sum) / n_global
-                #   where n_global = all_reduce(n_local) and W = world_size.
-                # FSDP backward divides grad by W, yielding grad(loss_sum)/n_global
-                # which is the correct per-token gradient.
+                    if not configs.looped:
+                        # ── CoT training (plain HuggingFace model) ──
+                        if dist.is_initialized():
+                            logits = outputs.logits
+                            shift_logits = logits[..., :-1, :].contiguous()
+                            shift_labels = train_labels[..., 1:].contiguous()
+                            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+                            loss_sum = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                            n_valid = (shift_labels.view(-1) != -100).sum().detach().clone().float()
+                            dist.all_reduce(n_valid, op=dist.ReduceOp.SUM)
+                            w = float(dist.get_world_size())
+                            loss = (loss_sum * w) / n_valid.clamp(min=1)
+                        else:
+                            loss = outputs.loss
 
-                if not configs.looped:
-                    # ── CoT training (plain HuggingFace model) ──
-                    if dist.is_initialized():
-                        logits = outputs.logits
-                        shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels = train_labels[..., 1:].contiguous()
-                        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
-                        loss_sum = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                        n_valid = (shift_labels.view(-1) != -100).sum().detach().clone().float()
-                        dist.all_reduce(n_valid, op=dist.ReduceOp.SUM)
+                    elif dist.is_initialized():
+                        # ── Looped / Lotus under FSDP ──
                         w = float(dist.get_world_size())
-                        loss = (loss_sum * w) / n_valid.clamp(min=1)
+
+                        # Main LM loss
+                        if hasattr(outputs, 'main_loss_sum'):
+                            # Lotus
+                            main_sum = outputs.main_loss_sum
+                            n_main = outputs.n_main_valid.detach().clone().float()
+                        else:
+                            # Plain looped
+                            main_sum = outputs.loss_sum
+                            n_main = outputs.n_valid_tokens.detach().clone().float()
+
+                        dist.all_reduce(n_main, op=dist.ReduceOp.SUM)
+                        # Theory-ablation toggle: when use_answer_loss=False, the answer-token
+                        # next-token-prediction CE is dropped entirely (only L_step / intermediate
+                        # loss drives the model). Default True preserves the standard objective.
+                        _use_ans_loss = getattr(configs, "use_answer_loss", True)
+                        if _use_ans_loss:
+                            loss = (main_sum * w) / n_main.clamp(min=1)
+                        else:
+                            # Graph-connected zero: stays in the autograd graph so backward()
+                            # succeeds even when no other loss term contributes (e.g., stage 0
+                            # before any latent slots are introduced). All gradients from this
+                            # path are 0; later loss terms (intermediate, ...) add their own.
+                            loss = main_sum * 0.0
+
+                        # Intermediate loss (Lotus)
+                        if hasattr(outputs, 'inter_loss_sum') and hasattr(outputs, 'n_inter_valid'):
+                            n_inter = outputs.n_inter_valid.detach().clone().float()
+                            dist.all_reduce(n_inter, op=dist.ReduceOp.SUM)
+                            if n_inter > 0:
+                                inter_loss = (outputs.inter_loss_sum * w) / n_inter.clamp(min=1)
+                                inter_weight = getattr(configs, "intermediate_loss_weight", 0.0)
+                                loss = loss + inter_weight * inter_loss
+
+                        # CODI distillation loss (Lotus with teacher)
+                        if hasattr(outputs, 'codi_loss_sum') and hasattr(outputs, 'n_codi_valid'):
+                            n_codi = outputs.n_codi_valid.detach().clone().float()
+                            dist.all_reduce(n_codi, op=dist.ReduceOp.SUM)
+                            if n_codi > 0:
+                                codi_loss = (outputs.codi_loss_sum * w) / n_codi.clamp(min=1)
+                                codi_weight = getattr(configs, "codi_loss_weight", 0.0)
+                                loss = loss + codi_weight * codi_loss
+
+                        # Intermediate answer supervision (suffix forward at each loop step)
+                        if hasattr(outputs, 'inter_answer_loss_sum') and hasattr(outputs, 'n_inter_answer_valid'):
+                            n_inter_ans = outputs.n_inter_answer_valid.detach().clone().float()
+                            dist.all_reduce(n_inter_ans, op=dist.ReduceOp.SUM)
+                            if n_inter_ans > 0:
+                                inter_ans_loss = (outputs.inter_answer_loss_sum * w) / n_inter_ans.clamp(min=1)
+                                inter_ans_weight = getattr(configs, "inter_answer_loss_weight", 0.0)
+                                loss = loss + inter_ans_weight * inter_ans_loss
+
                     else:
+                        # Single GPU — local mean is correct
                         loss = outputs.loss
 
-                elif dist.is_initialized():
-                    # ── Looped / Lotus under FSDP ──
-                    w = float(dist.get_world_size())
+                    (loss / n_micro).backward()
+                    loss_accum = loss_accum + loss.detach().float() / n_micro
+                    for _attr in ("main_loss", "intermediate_loss", "codi_loss", "inter_answer_loss"):
+                        _v = getattr(outputs, _attr, None)
+                        if _v is not None:
+                            _v = _v.detach().float() if isinstance(_v, torch.Tensor) else torch.tensor(float(_v))
+                            _comp_accum[_attr] = _comp_accum.get(_attr, 0.0) + _v / n_micro
 
-                    # Main LM loss
-                    if hasattr(outputs, 'main_loss_sum'):
-                        # Lotus
-                        main_sum = outputs.main_loss_sum
-                        n_main = outputs.n_main_valid.detach().clone().float()
-                    else:
-                        # Plain looped
-                        main_sum = outputs.loss_sum
-                        n_main = outputs.n_valid_tokens.detach().clone().float()
-
-                    dist.all_reduce(n_main, op=dist.ReduceOp.SUM)
-                    # Theory-ablation toggle: when use_answer_loss=False, the answer-token
-                    # next-token-prediction CE is dropped entirely (only L_step / intermediate
-                    # loss drives the model). Default True preserves the standard objective.
-                    _use_ans_loss = getattr(configs, "use_answer_loss", True)
-                    if _use_ans_loss:
-                        loss = (main_sum * w) / n_main.clamp(min=1)
-                    else:
-                        # Graph-connected zero: stays in the autograd graph so backward()
-                        # succeeds even when no other loss term contributes (e.g., stage 0
-                        # before any latent slots are introduced). All gradients from this
-                        # path are 0; later loss terms (intermediate, ...) add their own.
-                        loss = main_sum * 0.0
-
-                    # Intermediate loss (Lotus)
-                    if hasattr(outputs, 'inter_loss_sum') and hasattr(outputs, 'n_inter_valid'):
-                        n_inter = outputs.n_inter_valid.detach().clone().float()
-                        dist.all_reduce(n_inter, op=dist.ReduceOp.SUM)
-                        if n_inter > 0:
-                            inter_loss = (outputs.inter_loss_sum * w) / n_inter.clamp(min=1)
-                            inter_weight = getattr(configs, "intermediate_loss_weight", 0.0)
-                            loss = loss + inter_weight * inter_loss
-
-                    # CODI distillation loss (Lotus with teacher)
-                    if hasattr(outputs, 'codi_loss_sum') and hasattr(outputs, 'n_codi_valid'):
-                        n_codi = outputs.n_codi_valid.detach().clone().float()
-                        dist.all_reduce(n_codi, op=dist.ReduceOp.SUM)
-                        if n_codi > 0:
-                            codi_loss = (outputs.codi_loss_sum * w) / n_codi.clamp(min=1)
-                            codi_weight = getattr(configs, "codi_loss_weight", 0.0)
-                            loss = loss + codi_weight * codi_loss
-
-                    # Intermediate answer supervision (suffix forward at each loop step)
-                    if hasattr(outputs, 'inter_answer_loss_sum') and hasattr(outputs, 'n_inter_answer_valid'):
-                        n_inter_ans = outputs.n_inter_answer_valid.detach().clone().float()
-                        dist.all_reduce(n_inter_ans, op=dist.ReduceOp.SUM)
-                        if n_inter_ans > 0:
-                            inter_ans_loss = (outputs.inter_answer_loss_sum * w) / n_inter_ans.clamp(min=1)
-                            inter_ans_weight = getattr(configs, "inter_answer_loss_weight", 0.0)
-                            loss = loss + inter_ans_weight * inter_ans_loss
-
-                else:
-                    # Single GPU — local mean is correct
-                    loss = outputs.loss
-
-                loss.backward()
+                # Report the accumulated (full-batch) loss / component losses below.
+                loss = loss_accum
+                if n_micro > 1 and hasattr(outputs, "_replace"):
+                    outputs = outputs._replace(**_comp_accum)
 
                 # Gradient norm clipping.
                 # IMPORTANT: FSDP shards parameters across ranks, so each rank's
@@ -933,6 +978,7 @@ def main():
                         "train/loss": _loss_display,
                         "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                         "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/peak_mem_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
                     }
                     if use_looped:
                         log_dict["train/n_looped_iters"] = batch["n_looped_iters"]
@@ -962,6 +1008,13 @@ def main():
                     f"completed (loss: {_loss_val}{_ia_str}"
                 )
             pbar.close()
+            if rank == 0:
+                print(
+                    f"Epoch {epoch+1} done: peak GPU mem allocated="
+                    f"{torch.cuda.max_memory_allocated() / (1024 ** 3):.2f} GB, "
+                    f"reserved={torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB",
+                    flush=True,
+                )
             dist.barrier()
 
             # Save periodic checkpoint (model + optimizer + scheduler + RNG states)

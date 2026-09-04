@@ -232,6 +232,7 @@ Config keys (training) / CLI flags (`eval.py`):
 | `loop_layer_start`, `loop_layer_end` | Layer range of the recurrent block. Both unset = original full-model loop. |
 | `mid_loop_injection_mode` | How `h_rec^(t-1)` is injected at latent positions: `add`, `add_norm` (default, learnable RMSNorm), `add_final_norm`, `replace`. |
 | `mid_loop_readout_every_iter` | Run the coda + LM head every iteration (only needed for per-iteration analysis). |
+| `grad_accum_steps` (training only) | Split each `batch_size_training` batch into this many micro-batches and step once per full batch. Lets a single GPU keep the paper's overall batch (e.g. GPT-2: `batch_size_training: 128`, `grad_accum_steps: 8`). Default 1. |
 
 ```bash
 # Train (GPT-2, recur over layers [3, 9) of 12)
@@ -244,6 +245,10 @@ python scripts/eval.py --checkpoint ./outputs/gsm-lotus-gpt2-mid3-9/checkpoint_f
 
 # Correctness tests (tiny random Llama / GPT-2; checks equivalence with the full-model loop)
 python scripts/test_mid_loop.py
+
+# Whole GPT-2 ablation grid on one GPU (configs under args/midloop_gpt2/; trains, then evaluates
+# GSM8K test + OOD sets into outputs/gsm-lotus-gpt2-<run>/results_*.json; idempotent via marker files)
+nohup bash scripts/run_midloop_ablation_gpt2.sh > outputs/midloop_gpt2_queue.log 2>&1 &
 ```
 
 ## Citation

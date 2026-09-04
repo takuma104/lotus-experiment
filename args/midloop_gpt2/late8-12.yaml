@@ -1,0 +1,10 @@
+# GPT-2 mid-layer loop ablation: late 25% (layers [8, 12) of 12)
+base:
+  - ../gsm8k_lotus_gpt2.yaml
+  - _single_gpu.yaml
+
+name: gsm-lotus-gpt2-late8-12
+
+loop_layer_start: 8
+loop_layer_end: 12
+mid_loop_injection_mode: add_norm

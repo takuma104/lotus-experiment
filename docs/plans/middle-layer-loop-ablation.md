@@ -151,3 +151,32 @@ uv run python scripts/eval.py --model_id openai-community/gpt2 --checkpoint <ckp
 - `generate(output_embedding=True)` が返す埋め込みは、中間層ループでは注入後ではなく元の埋め込みになる。
 - FSDP は `LlamaDecoderLayer` 単位でラップされるため、層を個別に呼んでも問題ない。
   ただし全ランクで同じ層列を同じ回数呼ぶ必要がある (現状の分岐は入力に依存しないので満たす)。
+
+## 実験ログ
+
+### 2026-09-04: GPT-2 アブレーション格子を開始
+
+環境: RTX 5090 (32 GB) × 1、fp32 (論文と同じ)。
+
+- 論文の全体バッチ 128 (64 × 2 GPU) は 1 GPU では stage 6 でメモリ不足 (micro-batch 64/32 とも OOM) のため、
+  `scripts/run.py` に勾配累積 `grad_accum_steps` を追加し、`batch_size_training: 128`, `grad_accum_steps: 8`
+  (micro-batch 16) で全体バッチ 128 を維持した。最長 5000 サンプルでの最悪ケースはピーク 19.4 GB。
+  micro-batch ごとの損失は `1/grad_accum_steps` 倍して累積する (micro-batch ごとの token 平均の平均。
+  2 GPU 版の「全体 token 平均」とは正規化がごく僅かに異なる)。
+- 設定ファイル: `args/midloop_gpt2/` (共通の 1 GPU 設定は `_single_gpu.yaml`)。
+- 実行: `scripts/run_midloop_ablation_gpt2.sh` が以下を順に学習 → `checkpoint_final` を
+  `eval.py` で GSM8K test / GSM-Hard / MultiArith / SVAMP 評価 (`outputs/<run>/results_{gsm8k,ood}.json`)。
+  進捗は `outputs/midloop_gpt2_queue.log` と `outputs/<run>/train.log`、W&B project `lotus`。
+
+| 順 | run | ℓ_s | ℓ_e | 注入 | 備考 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `gsm-lotus-gpt2-full-legacy` | – | – | (既存の埋め込み注入) | 再現ベースライン (論文 GPT-2 LOTUS: 44.1 ± 0.7) |
+| 2 | `gsm-lotus-gpt2-mid3-9` | 3 | 9 | add_norm | middle 50% |
+| 3 | `gsm-lotus-gpt2-mid4-8` | 4 | 8 | add_norm | middle 25% |
+| 4 | `gsm-lotus-gpt2-early0-4` | 0 | 4 | add_norm | early 25% |
+| 5 | `gsm-lotus-gpt2-late8-12` | 8 | 12 | add_norm | late 25% |
+| 6 | `gsm-lotus-gpt2-full0-12` | 0 | 12 | add_norm | 注入モードの対照 (層範囲は全層) |
+
+debug モードでの stage-6 速度 (3013 step/epoch): 全層ループ 1.63 s/step (≈ 82 分/epoch)、
+[3, 9) ループ 1.07 s/step (≈ 54 分/epoch)。30 epoch のうち stage 6 が 24 epoch なので、
+全層ループ 1 本あたり ≈ 1.5 日、6 本の合計は ≈ 7 日程度の見込み。

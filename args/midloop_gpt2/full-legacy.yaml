@@ -1,0 +1,8 @@
+# GPT-2 mid-layer loop ablation: reproduction baseline.
+# Original LOTUS full-model loop (loop_layer_start/end unset), same budget
+# (K=6 blocks x c=13 latents, R=6 iterations) as the rest of the grid.
+base:
+  - ../gsm8k_lotus_gpt2.yaml
+  - _single_gpu.yaml
+
+name: gsm-lotus-gpt2-full-legacy

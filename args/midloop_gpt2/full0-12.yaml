@@ -1,0 +1,10 @@
+# GPT-2 mid-layer loop ablation: full range through the mid-loop code path with add_norm injection (control for the injection mode; add_final_norm would equal the legacy loop exactly)
+base:
+  - ../gsm8k_lotus_gpt2.yaml
+  - _single_gpu.yaml
+
+name: gsm-lotus-gpt2-full0-12
+
+loop_layer_start: 0
+loop_layer_end: 12
+mid_loop_injection_mode: add_norm

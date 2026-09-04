@@ -110,6 +110,8 @@ def main():
                         help="Evaluate a CoT model (plain causal LM, no latent tokens)")
     parser.add_argument("--save_preds", default=None,
                         help="Optional path to dump per-example predictions (JSON).")
+    parser.add_argument("--save_results", default=None,
+                        help="Optional path to dump per-dataset accuracy / timing / memory summary (JSON).")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -424,6 +426,14 @@ def main():
         with open(args.save_preds, "w") as f:
             json.dump(dump, f)
         print(f"Saved per-example predictions to {args.save_preds}")
+
+    if args.save_results:
+        summary = {ds: {k: v for k, v in res.items() if k != "per_example"} for ds, res in results.items()}
+        summary["_args"] = vars(args)
+        summary["_total_time"] = total_elapsed
+        with open(args.save_results, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved results summary to {args.save_results}")
 
 
 if __name__ == "__main__":

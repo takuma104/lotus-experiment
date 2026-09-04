@@ -1,0 +1,9 @@
+# Single-GPU overrides shared by the GPT-2 mid-layer-loop ablation grid.
+# The paper trains GPT-2 with an overall batch of 128 (64 x 2 GPUs). On one
+# 32 GB GPU a stage-6 batch of 64 (fp32) does not fit, so we keep the overall
+# batch at 128 via gradient accumulation (8 micro-batches of 16).
+batch_size_training: 128
+grad_accum_steps: 8
+# Let a re-launch of the queue resume from the latest checkpoint_N (model +
+# optimizer + RNG) instead of restarting the 30-epoch run from scratch.
+allow_resume_from_checkpoint: True
