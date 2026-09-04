@@ -9,6 +9,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from transformers.models.gpt2 import GPT2LMHeadModel
+from transformers.modeling_attn_mask_utils import (
+    AttentionMaskConverter,
+    _prepare_4d_causal_attention_mask_for_sdpa,
+)
+
+
+class _OutputWrapper:
+    """Minimal stand-in for HF CausalLMOutput used by the loop code."""
+
+    def __init__(self, logits, last_hidden_state, past_key_values):
+        self.logits = logits
+        self.last_hidden_state = last_hidden_state
+        self.past_key_values = past_key_values
+
+
+class _RMSNorm(nn.Module):
+    """Learnable RMSNorm (gain initialised to 1) used by the mid-layer loop's
+    ``add_norm`` injection mode to bound the scale of the recurrent term."""
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * xf.to(dtype)
+
+
+MID_LOOP_INJECTION_MODES = ("add", "add_norm", "add_final_norm", "replace")
 
 Outputs = namedtuple("Outputs", [
     "loss", "inputs_embeds", "logits", "intermediate_logits",
@@ -201,13 +233,7 @@ def efficient_forward(model, inputs_embeds, attention_mask, position_ids, past_k
         logits = lm_head(hidden_states)
         past_key_values = model_outputs.past_key_values
 
-    class OutputWrapper:
-        def __init__(self, logits, last_hidden_state, past_key_values):
-            self.logits = logits
-            self.last_hidden_state = last_hidden_state
-            self.past_key_values = past_key_values
-
-    return OutputWrapper(logits, hidden_states, past_key_values)
+    return _OutputWrapper(logits, hidden_states, past_key_values)
 
 
 def _clone_kv_cache(cache):
@@ -256,6 +282,10 @@ class Lotus(nn.Module):
         flat_intermediate_supervision=False,  # If True, pack CoT tokens contiguously across all latent slots
         ia_loss_after_loop=False,  # If True, compute IA loss once after all loops using all latent hidden states
         latent_injection_mode="add",  # "add" (default, current): embed_t = original + h_{t-1}; "replace": embed_t = h_{t-1} (drops residual to test recurrent variance amplification)
+        loop_layer_start=None,  # Mid-layer loop: first layer index of the recurrent block (None -> full-model loop)
+        loop_layer_end=None,  # Mid-layer loop: one past the last layer index of the recurrent block (None -> full-model loop)
+        mid_loop_injection_mode="add_norm",  # Mid-layer loop injection: "add" | "add_norm" | "add_final_norm" | "replace"
+        mid_loop_readout_every_iter=False,  # Mid-layer loop: run coda + LM head at every iteration (needed only for analysis)
     ):
 
         super(Lotus, self).__init__()
@@ -300,6 +330,35 @@ class Lotus(nn.Module):
             self.embedding = self.base_causallm.transformer.get_input_embeddings()
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
+
+        # Mid-layer loop configuration (ablation: recur only over layers
+        # [loop_layer_start, loop_layer_end) instead of the whole model).
+        self._n_layers = self._num_layers()
+        self.mid_loop = loop_layer_start is not None or loop_layer_end is not None
+        self.mid_loop_norm = None
+        if self.mid_loop:
+            assert self._is_gpt2 or self._is_llama, "mid-layer loop supports GPT-2 and Llama backbones only"
+            ls = 0 if loop_layer_start is None else int(loop_layer_start)
+            le = self._n_layers if loop_layer_end is None else int(loop_layer_end)
+            assert 0 <= ls < le <= self._n_layers, (
+                f"loop layer range [{ls}, {le}) must satisfy 0 <= start < end <= n_layers={self._n_layers}"
+            )
+            assert mid_loop_injection_mode in MID_LOOP_INJECTION_MODES, (
+                f"unknown mid_loop_injection_mode: {mid_loop_injection_mode}"
+            )
+            self.loop_layer_start = ls
+            self.loop_layer_end = le
+            self.mid_loop_injection_mode = mid_loop_injection_mode
+            self.mid_loop_readout_every_iter = mid_loop_readout_every_iter
+            if mid_loop_injection_mode == "add_norm":
+                cfg = self.base_causallm.config
+                eps = getattr(cfg, "rms_norm_eps", None) or getattr(cfg, "layer_norm_epsilon", 1e-6)
+                self.mid_loop_norm = _RMSNorm(self.embedding.embedding_dim, eps=eps)
+        else:
+            self.loop_layer_start = 0
+            self.loop_layer_end = self._n_layers
+            self.mid_loop_injection_mode = None
+            self.mid_loop_readout_every_iter = False
 
         # Initialize lightweight auxiliary decoder for IA supervision if requested
         if self.ia_decoder_layers > 0:
@@ -425,8 +484,151 @@ class Lotus(nn.Module):
         self.ia_decoder = ExternalIADecoder(aux_model, main_hidden)
         return self.ia_decoder
 
+    # ------------------------------------------------------------------
+    # Mid-layer loop helpers: layer-range forward for GPT-2 / Llama backbones
+    # ------------------------------------------------------------------
+    def _num_layers(self):
+        if self._is_gpt2:
+            return len(self.base_causallm.transformer.h)
+        if self._is_llama:
+            return len(self.base_causallm.model.layers)
+        return getattr(self.base_causallm.config, "num_hidden_layers", 0)
+
+    def _final_norm(self):
+        if self._is_gpt2:
+            return self.base_causallm.transformer.ln_f
+        return self.base_causallm.model.norm
+
+    def _embed_to_residual(self, inputs_embeds, position_ids):
+        """Map input embeddings to the residual stream entering layer 0."""
+        if self._is_gpt2:
+            t = self.base_causallm.transformer
+            return t.drop(inputs_embeds + t.wpe(position_ids))
+        return inputs_embeds
+
+    def _new_empty_cache(self):
+        if self._is_gpt2:
+            return tuple([None] * self._n_layers)
+        from transformers import DynamicCache
+        return DynamicCache()
+
+    def _llama_causal_mask(self, attention_mask, hidden, cache_position, past_len):
+        """Replicates LlamaModel._update_causal_mask but with an explicit
+        past length (DynamicCache.get_seq_length() is unreliable here because
+        layer 0 already holds loop-region entries after the prelude)."""
+        m = self.base_causallm.model
+        impl = m.config._attn_implementation
+        if impl == "flash_attention_2":
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
+        if impl == "sdpa" and AttentionMaskConverter._ignore_causal_mask_sdpa(
+            attention_mask,
+            inputs_embeds=hidden,
+            past_key_values_length=past_len,
+            is_training=m.training,
+        ):
+            return None
+        seq_len = hidden.shape[1]
+        target_length = (
+            attention_mask.shape[-1]
+            if isinstance(attention_mask, torch.Tensor)
+            else past_len + seq_len + 1
+        )
+        causal_mask = m._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=seq_len,
+            target_length=target_length,
+            dtype=hidden.dtype,
+            device=hidden.device,
+            cache_position=cache_position,
+            batch_size=hidden.shape[0],
+        )
+        if impl == "sdpa" and attention_mask is not None and attention_mask.device.type == "cuda":
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, torch.finfo(hidden.dtype).min)
+        return causal_mask
+
+    def _run_layers(self, hidden, layer_start, layer_end, attention_mask, position_ids, past_len, cache):
+        """Run transformer layers [layer_start, layer_end) on ``hidden``.
+
+        Args:
+            hidden: (batch, seq, d) residual-stream input to layer ``layer_start``.
+            attention_mask: 2D mask of shape (batch, past_len + seq).
+            position_ids: (batch, seq) absolute positions.
+            past_len: number of cached positions each layer in the range already holds.
+            cache: DynamicCache / legacy tuple (Llama) or tuple of per-layer (k, v) / None (GPT-2).
+                   Llama caches are mutated in place (clone before calling if needed);
+                   GPT-2 caches are immutable tuples and a new tuple is returned.
+        Returns:
+            (hidden, cache) with the layers' loop-region K/V appended.
+        """
+        if layer_start >= layer_end:
+            return hidden, cache
+        bsz, seq_len, _ = hidden.shape
+        if self._is_gpt2:
+            t = self.base_causallm.transformer
+            impl = t._attn_implementation
+            if impl == "flash_attention_2":
+                mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+            elif impl == "sdpa":
+                mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask, (bsz, seq_len), hidden, past_len
+                )
+            else:
+                mask = None
+                if attention_mask is not None:
+                    mask = attention_mask[:, None, None, :].to(hidden.dtype)
+                    mask = (1.0 - mask) * torch.finfo(hidden.dtype).min
+            cache = list(cache) if cache is not None else [None] * self._n_layers
+            for i in range(layer_start, layer_end):
+                out = t.h[i](hidden, layer_past=cache[i], attention_mask=mask, use_cache=True)
+                hidden = out[0]
+                cache[i] = out[1]
+            return hidden, tuple(cache)
+
+        # Llama
+        from transformers import DynamicCache
+        if cache is None:
+            cache = DynamicCache()
+        elif isinstance(cache, tuple):
+            cache = DynamicCache.from_legacy_cache(cache)
+        m = self.base_causallm.model
+        cache_position = torch.arange(past_len, past_len + seq_len, device=hidden.device)
+        causal_mask = self._llama_causal_mask(attention_mask, hidden, cache_position, past_len)
+        position_embeddings = m.rotary_emb(hidden, position_ids)
+        for i in range(layer_start, layer_end):
+            hidden = m.layers[i](
+                hidden,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=cache,
+                use_cache=True,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )[0]
+        return hidden, cache
+
+    def _mid_loop_readout(self, recur_states, attention_mask, position_ids, past_len, cache):
+        """Coda layers [loop_layer_end, L) + final norm + LM head."""
+        h_out, cache = self._run_layers(
+            recur_states, self.loop_layer_end, self._n_layers,
+            attention_mask, position_ids, past_len, cache,
+        )
+        h_out = self._final_norm()(h_out)
+        logits = self.base_causallm.lm_head(h_out)
+        return _OutputWrapper(logits, h_out, cache)
+
+    def _mid_loop_recurrent_term(self, recur_states):
+        """Transform of h_rec^(t-1) that gets added at latent positions."""
+        mode = self.mid_loop_injection_mode
+        if mode == "add_norm":
+            return self.mid_loop_norm(recur_states)
+        if mode == "add_final_norm":
+            return self._final_norm()(recur_states)
+        return recur_states  # "add" / "replace"
+
     def forward(
-        self, input_ids, attention_mask, labels, position_ids, n_looped_iters=0, 
+        self, input_ids, attention_mask, labels, position_ids, n_looped_iters=0,
         replaced_cot_steps=None, sample_stages=None, **kwargs
     ):
         """
@@ -556,38 +758,65 @@ class Lotus(nn.Module):
         # Clone prefix cache — Llama's DynamicCache is mutable; without cloning,
         # Step 2 would grow it from loop_start → loop_end entries, corrupting it
         # for subsequent loop iterations that also need the original prefix cache.
-        step2_kv = _clone_kv_cache(prefix_kv_cache)
-        # Forward through loop region
-        # When prefix_kv_cache is None (e.g. gradient checkpointing), include
-        # prefix tokens in the input so the loop region can still attend to them.
-        if prefix_kv_cache is not None:
-            _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
+        if self.mid_loop:
+            # ---- Mid-layer loop: prelude once, then the recurrent block ----
+            # Layout of the recurrence (see docs/plans/middle-layer-loop-ablation.md):
+            #   h_pre        = layers[0:ls](E)                       (once)
+            #   h_rec^(0)    = layers[ls:le](h_pre)                  (once)
+            #   h_rec^(t)    = layers[ls:le](inject(h_pre, h_rec^(t-1)))   t = 1..R
+            #   readout      = layers[le:L] + norm + lm_head          (after the loop)
+            assert sample_stages is None, "mid-layer loop does not support sample_stages"
+            assert not self.freeze_supervised_blocks, "mid-layer loop does not support freeze_supervised_blocks"
+            assert prefix_kv_cache is not None or loop_start == 0, (
+                "mid-layer loop requires the prefix KV cache (gradient checkpointing disables it)"
+            )
             _loop_pos = position_ids[:, loop_start:loop_end]
             _loop_mask = attention_mask[:, :loop_end]
-        elif loop_start > 0:
-            # No KV cache but prefix exists — include prefix in forward
-            _loop_embeds = inputs_embeds[:, :loop_end, :]
-            _loop_pos = position_ids[:, :loop_end]
-            _loop_mask = attention_mask[:, :loop_end]
+            _mid_past_len = loop_start
+            prelude_kv = _clone_kv_cache(prefix_kv_cache) if prefix_kv_cache is not None else self._new_empty_cache()
+            h_pre = self._embed_to_residual(inputs_embeds[:, loop_start:loop_end, :], _loop_pos)
+            h_pre, prelude_kv = self._run_layers(
+                h_pre, 0, self.loop_layer_start, _loop_mask, _loop_pos, _mid_past_len, prelude_kv,
+            )
+            recur_states, _ = self._run_layers(
+                h_pre, self.loop_layer_start, self.loop_layer_end,
+                _loop_mask, _loop_pos, _mid_past_len, _clone_kv_cache(prelude_kv),
+            )
+            outputs = None
+            hidden_states = None
         else:
-            _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
-            _loop_pos = position_ids[:, loop_start:loop_end]
-            _loop_mask = attention_mask[:, loop_start:loop_end]
+            step2_kv = _clone_kv_cache(prefix_kv_cache)
+            # Forward through loop region
+            # When prefix_kv_cache is None (e.g. gradient checkpointing), include
+            # prefix tokens in the input so the loop region can still attend to them.
+            if prefix_kv_cache is not None:
+                _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
+                _loop_pos = position_ids[:, loop_start:loop_end]
+                _loop_mask = attention_mask[:, :loop_end]
+            elif loop_start > 0:
+                # No KV cache but prefix exists — include prefix in forward
+                _loop_embeds = inputs_embeds[:, :loop_end, :]
+                _loop_pos = position_ids[:, :loop_end]
+                _loop_mask = attention_mask[:, :loop_end]
+            else:
+                _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
+                _loop_pos = position_ids[:, loop_start:loop_end]
+                _loop_mask = attention_mask[:, loop_start:loop_end]
 
-        _fwd_embeds = _loop_embeds
-        outputs = efficient_forward(
-            self.base_causallm, _fwd_embeds, _loop_mask, _loop_pos,
-            past_key_values=step2_kv, is_gpt2=self._is_gpt2,
-        )
+            _fwd_embeds = _loop_embeds
+            outputs = efficient_forward(
+                self.base_causallm, _fwd_embeds, _loop_mask, _loop_pos,
+                past_key_values=step2_kv, is_gpt2=self._is_gpt2,
+            )
 
-        # Extract loop-region hidden states (if prefix was included, slice it off)
-        if prefix_kv_cache is None and loop_start > 0:
-            hidden_states = outputs.last_hidden_state[:, loop_start:, :]
-        else:
-            hidden_states = outputs.last_hidden_state
+            # Extract loop-region hidden states (if prefix was included, slice it off)
+            if prefix_kv_cache is None and loop_start > 0:
+                hidden_states = outputs.last_hidden_state[:, loop_start:, :]
+            else:
+                hidden_states = outputs.last_hidden_state
 
         # Helper function to vectorize embedding injection
-        def inject_latent_embeddings(inputs_embeds, original_embeddings, hidden_states, latent_ranges, offset=0):
+        def inject_latent_embeddings(inputs_embeds, original_embeddings, hidden_states, latent_ranges, offset=0, mode=None):
             """
             Vectorized injection of hidden states into latent token positions.
 
@@ -623,7 +852,9 @@ class Lotus(nn.Module):
             # latent_injection_mode:
             #   "add"     (default): original + hidden  (residual; original embedding added every iter)
             #   "replace":            hidden          (no residual; tests recurrent variance amplifier)
-            if self.latent_injection_mode == "replace":
+            if mode is None:
+                mode = self.latent_injection_mode
+            if mode == "replace":
                 updated_embeds = hidden_states
             else:  # "add"
                 updated_embeds = original_embeddings + hidden_states
@@ -700,49 +931,79 @@ class Lotus(nn.Module):
         # Maps loop_idx -> hidden_states for that iteration
         per_loop_hidden_states = {} if sample_stages is not None else None
 
+        # Mid-layer loop: the coda (+ LM head) is only needed when something
+        # reads logits / final hidden states during the loop, or at the end.
+        mid_readout_every_iter = self.mid_loop and (
+            self.mid_loop_readout_every_iter
+            or compute_intermediate_loss_in_loop
+            or compute_inter_answer_loss
+        )
+
         # Step 3: Loop iterations - refine loop region with prefix cache reuse
         for loop_idx in range(n_looped_iters):
-            # Clone prefix KV cache each iteration — DynamicCache is mutable,
-            # so forward calls append loop-region entries in-place.
-            loop_kv = _clone_kv_cache(prefix_kv_cache)
-
-            # Vectorized embedding injection for latent positions only
-            inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
-                inputs_embeds[:, loop_start:loop_end, :],
-                original_embeddings[:, loop_start:loop_end, :],
-                hidden_states,
-                latent_ranges,
-                offset=loop_start,  # Convert absolute to relative positions
-            )
-
-            # Forward through loop region with updated embeddings
-            # Reuse prefix cache (positions before loop_start never change)
-            # Same prefix-inclusion logic as Step 2:
-            if prefix_kv_cache is not None:
-                _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
-                _loop_pos = position_ids[:, loop_start:loop_end]
-                _loop_mask = attention_mask[:, :loop_end]
-            elif loop_start > 0:
-                _loop_embeds = inputs_embeds[:, :loop_end, :]
-                _loop_pos = position_ids[:, :loop_end]
-                _loop_mask = attention_mask[:, :loop_end]
+            if self.mid_loop:
+                # Clone the post-prelude cache: the recurrent block appends its
+                # loop-region K/V in place (Llama) and must start fresh each time.
+                loop_kv = _clone_kv_cache(prelude_kv)
+                h_in = inject_latent_embeddings(
+                    h_pre, h_pre,
+                    self._mid_loop_recurrent_term(recur_states),
+                    latent_ranges,
+                    offset=loop_start,
+                    mode="replace" if self.mid_loop_injection_mode == "replace" else "add",
+                )
+                recur_states, loop_kv = self._run_layers(
+                    h_in, self.loop_layer_start, self.loop_layer_end,
+                    _loop_mask, _loop_pos, _mid_past_len, loop_kv,
+                )
+                if mid_readout_every_iter or loop_idx == n_looped_iters - 1:
+                    outputs = self._mid_loop_readout(recur_states, _loop_mask, _loop_pos, _mid_past_len, loop_kv)
+                    hidden_states = outputs.last_hidden_state
+                else:
+                    outputs = None
+                    hidden_states = None
             else:
-                _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
-                _loop_pos = position_ids[:, loop_start:loop_end]
-                _loop_mask = attention_mask[:, loop_start:loop_end]
+                # Clone prefix KV cache each iteration — DynamicCache is mutable,
+                # so forward calls append loop-region entries in-place.
+                loop_kv = _clone_kv_cache(prefix_kv_cache)
 
-            _fwd_embeds = _loop_embeds
-            outputs = efficient_forward(
-                self.base_causallm, _fwd_embeds, _loop_mask, _loop_pos,
-                past_key_values=loop_kv, is_gpt2=self._is_gpt2,
-            )
+                # Vectorized embedding injection for latent positions only
+                inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
+                    inputs_embeds[:, loop_start:loop_end, :],
+                    original_embeddings[:, loop_start:loop_end, :],
+                    hidden_states,
+                    latent_ranges,
+                    offset=loop_start,  # Convert absolute to relative positions
+                )
 
-            # Extract loop-region hidden states (if prefix was included, slice it off)
-            if prefix_kv_cache is None and loop_start > 0:
-                hidden_states = outputs.last_hidden_state[:, loop_start:, :]
-            else:
-                hidden_states = outputs.last_hidden_state
-            
+                # Forward through loop region with updated embeddings
+                # Reuse prefix cache (positions before loop_start never change)
+                # Same prefix-inclusion logic as Step 2:
+                if prefix_kv_cache is not None:
+                    _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
+                    _loop_pos = position_ids[:, loop_start:loop_end]
+                    _loop_mask = attention_mask[:, :loop_end]
+                elif loop_start > 0:
+                    _loop_embeds = inputs_embeds[:, :loop_end, :]
+                    _loop_pos = position_ids[:, :loop_end]
+                    _loop_mask = attention_mask[:, :loop_end]
+                else:
+                    _loop_embeds = inputs_embeds[:, loop_start:loop_end, :]
+                    _loop_pos = position_ids[:, loop_start:loop_end]
+                    _loop_mask = attention_mask[:, loop_start:loop_end]
+
+                _fwd_embeds = _loop_embeds
+                outputs = efficient_forward(
+                    self.base_causallm, _fwd_embeds, _loop_mask, _loop_pos,
+                    past_key_values=loop_kv, is_gpt2=self._is_gpt2,
+                )
+
+                # Extract loop-region hidden states (if prefix was included, slice it off)
+                if prefix_kv_cache is None and loop_start > 0:
+                    hidden_states = outputs.last_hidden_state[:, loop_start:, :]
+                else:
+                    hidden_states = outputs.last_hidden_state
+
             # Save hidden states for per-sample stage handling
             if per_loop_hidden_states is not None:
                 per_loop_hidden_states[loop_idx] = hidden_states.clone()
@@ -772,7 +1033,8 @@ class Lotus(nn.Module):
                 hidden_states = torch.where(frozen_mask.unsqueeze(-1), frozen_values, hidden_states)
             
             # Only store intermediate logits for generation (not training) to save memory
-            if not self.training:
+            # (mid-layer loop: only iterations where the readout was computed)
+            if not self.training and outputs is not None:
                 intermediate_logits.append(outputs.logits)
 
             # Compute intermediate supervision loss for this iteration
@@ -1150,14 +1412,17 @@ class Lotus(nn.Module):
 
             hidden_states = torch.where(frozen_mask.unsqueeze(-1), frozen_values, hidden_states)
 
-        # Inject final hidden states into embeddings for suffix processing
-        inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
-            inputs_embeds[:, loop_start:loop_end, :],
-            original_embeddings[:, loop_start:loop_end, :],
-            hidden_states,
-            latent_ranges,
-            offset=loop_start,
-        )
+        # Inject final hidden states into embeddings for suffix processing.
+        # (Mid-layer loop: the suffix attends to the post-loop latents through the
+        # KV cache built by the coda pass, so inputs_embeds stays untouched.)
+        if not self.mid_loop:
+            inputs_embeds[:, loop_start:loop_end, :] = inject_latent_embeddings(
+                inputs_embeds[:, loop_start:loop_end, :],
+                original_embeddings[:, loop_start:loop_end, :],
+                hidden_states,
+                latent_ranges,
+                offset=loop_start,
+            )
 
         # After final loop iteration, save combined KV cache for processing remaining tokens.
         # With gradient checkpointing, HF silently sets use_cache=False, so

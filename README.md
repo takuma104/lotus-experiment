@@ -217,6 +217,35 @@ Match `--n_looped_iters` / `--c_thought` to how the checkpoint was trained — u
 for GPT-2 checkpoints and `--c_thought 25` for Llama-1B/3B (and set `--model_id` to the matching
 base model).
 
+## Mid-layer loop ablation (experimental)
+
+By default LOTUS loops the *whole* backbone. This fork adds an ablation that recurs only over a
+contiguous layer range `[loop_layer_start, loop_layer_end)` (prelude layers run once, the recurrent
+block runs `R+1` times, coda layers + LM head run once after the loop), following the
+"middle-layer recurrence" idea of T2MLR. See
+[docs/plans/middle-layer-loop-ablation.md](docs/plans/middle-layer-loop-ablation.md) for the design.
+
+Config keys (training) / CLI flags (`eval.py`):
+
+| Key | Meaning |
+| --- | --- |
+| `loop_layer_start`, `loop_layer_end` | Layer range of the recurrent block. Both unset = original full-model loop. |
+| `mid_loop_injection_mode` | How `h_rec^(t-1)` is injected at latent positions: `add`, `add_norm` (default, learnable RMSNorm), `add_final_norm`, `replace`. |
+| `mid_loop_readout_every_iter` | Run the coda + LM head every iteration (only needed for per-iteration analysis). |
+
+```bash
+# Train (GPT-2, recur over layers [3, 9) of 12)
+CONFIG=args/gsm8k_lotus_gpt2_midloop.yaml NPROC_PER_NODE=2 bash launch_train.sh
+
+# Evaluate with the same layer range / injection mode used at training
+python scripts/eval.py --checkpoint ./outputs/gsm-lotus-gpt2-mid3-9/checkpoint_final \
+  --model_id openai-community/gpt2 --datasets gsm8k --fp32 \
+  --n_looped_iters 6 --c_thought 13 --loop_layer_start 3 --loop_layer_end 9
+
+# Correctness tests (tiny random Llama / GPT-2; checks equivalence with the full-model loop)
+python scripts/test_mid_loop.py
+```
+
 ## Citation
 
 If you find it useful, please cite:

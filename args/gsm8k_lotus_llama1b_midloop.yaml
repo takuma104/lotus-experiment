@@ -1,0 +1,16 @@
+# GSM8K Lotus with Llama-3.2-1B, mid-layer loop ablation.
+# Llama-3.2-1B has 16 layers; recur only over layers [4, 12) (middle 50%).
+# Other suggested settings (see docs/plans/middle-layer-loop-ablation.md):
+#   full   : loop_layer_start: 0,  loop_layer_end: 16
+#   mid 25%: loop_layer_start: 6,  loop_layer_end: 10
+#   early  : loop_layer_start: 0,  loop_layer_end: 4
+#   late   : loop_layer_start: 12, loop_layer_end: 16
+base:
+  - gsm8k_lotus_llama1b.yaml
+
+name: gsm-lotus-llama1b-mid4-12
+
+loop_layer_start: 4
+loop_layer_end: 12
+# "add" | "add_norm" | "add_final_norm" | "replace"
+mid_loop_injection_mode: add_norm

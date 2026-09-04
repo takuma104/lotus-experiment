@@ -382,7 +382,17 @@ def main():
             flat_intermediate_supervision=getattr(configs, "flat_intermediate_supervision", False),
             ia_loss_after_loop=getattr(configs, "ia_loss_after_loop", False),
             latent_injection_mode=getattr(configs, "latent_injection_mode", "add"),
+            # Mid-layer loop ablation (None/None = full-model loop, the paper's default)
+            loop_layer_start=getattr(configs, "loop_layer_start", None),
+            loop_layer_end=getattr(configs, "loop_layer_end", None),
+            mid_loop_injection_mode=getattr(configs, "mid_loop_injection_mode", "add_norm"),
+            mid_loop_readout_every_iter=getattr(configs, "mid_loop_readout_every_iter", False),
         )
+        if model.mid_loop and rank == 0:
+            print(
+                f"Mid-layer loop enabled: layers [{model.loop_layer_start}, {model.loop_layer_end}) "
+                f"of {model._n_layers}, injection={model.mid_loop_injection_mode}"
+            )
 
     # If resuming AND the checkpoint contains ia_decoder weights, we need the
     # ia_decoder module to exist BEFORE load_state_dict so the keys have

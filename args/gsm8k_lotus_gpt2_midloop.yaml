@@ -1,0 +1,16 @@
+# GSM8K Lotus with GPT-2, mid-layer loop ablation.
+# GPT-2 has 12 layers; recur only over layers [3, 9) (middle 50%).
+# Other suggested settings (see docs/plans/middle-layer-loop-ablation.md):
+#   full   : loop_layer_start: 0,  loop_layer_end: 12
+#   mid 25%: loop_layer_start: 4,  loop_layer_end: 8
+#   early  : loop_layer_start: 0,  loop_layer_end: 4
+#   late   : loop_layer_start: 8,  loop_layer_end: 12
+base:
+  - gsm8k_lotus_gpt2.yaml
+
+name: gsm-lotus-gpt2-mid3-9
+
+loop_layer_start: 3
+loop_layer_end: 9
+# "add" | "add_norm" | "add_final_norm" | "replace"
+mid_loop_injection_mode: add_norm

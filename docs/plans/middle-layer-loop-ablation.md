@@ -1,0 +1,153 @@
+# 中間層のみループ (Middle-Layer Recurrence) アブレーション計画
+
+作成日: 2026-09-04
+
+## 目的
+
+LOTUS ([2606.31779](../paper/2606.31779.md)) は、latent プレフィックスに対して LM 全体 `f_θ` を R 回反復する
+「全層ループ」を採用している。一方 T2MLR ([2607.15178](../paper/2607.15178.md)) は、
+再帰を中間層の一部 (全体の 20% 程度) に限定した方が全層再帰より良い、と報告している
+(Table 11 の recurrence-location ablation)。Huginn / Ouro など他の looped transformer でも
+prelude / recurrent block / coda の 3 段構成が一般的である。
+
+LOTUS 論文にはループ対象レイヤー範囲のアブレーションが無いため、本リポジトリに
+**「層 `[ℓ_start, ℓ_end)` のみを R 回反復する」** モードを追加し、
+全層ループ (既存実装) と比較する。
+
+## 現状の実装 (全層ループ)
+
+`scripts/lotus.py` の `Lotus.forward` は次の流れになっている。
+
+| Step | 内容 | コード |
+| --- | --- | --- |
+| 1 | prefix `[Q, BoT]` を 1 回 forward して KV キャッシュ `C_pre` を作る | `lotus.py` Step 1 |
+| 2 | ループ領域 `[BoT, lat…lat]` を全層 forward し `h^(0)` を得る | `efficient_forward` |
+| 3 | R 回: `E + h^(t-1)` を latent 位置の **入力埋め込み** に注入し、全層 forward | `inject_latent_embeddings` |
+| 4 | 最終イテレーションの KV キャッシュで suffix `[EoT, A]` を forward | Step 4 |
+
+注入元は最終 norm 後の `last_hidden_state`、注入先は入力埋め込みなので、
+再帰信号は必ず「最終層 → 埋め込み」を経由する。これが T2MLR 論文が指摘する
+「再帰情報が中間層の外側に押し出される」構造そのものである。
+
+## 提案する構成 (中間層ループ)
+
+層数 L のモデルに対し、`loop_layer_start = ℓ_s`, `loop_layer_end = ℓ_e` (0 ≤ ℓ_s < ℓ_e ≤ L) を指定する。
+
+```
+prelude : 層 [0, ℓ_s)     ループ領域に 1 回だけ適用 → h_pre (残差ストリーム)
+loop    : 層 [ℓ_s, ℓ_e)   R+1 回 (初回 + R 回の注入付き反復)
+            h_rec^(0) = mid(h_pre)
+            h_rec^(t) = mid( inject(h_pre, h_rec^(t-1)) )   t = 1..R
+coda    : 層 [ℓ_e, L) + 最終 norm + lm_head   最終イテレーション後に 1 回
+            (per-iter 監督 / IA loss を使う場合は毎イテレーション)
+```
+
+- 注入は既存実装と同じく latent 位置のみ (BoT 位置は固定)。
+- prefix キャッシュ `C_pre` は全層分あるので、prelude / loop / coda の各段でそのまま使える。
+  `DynamicCache` は layer_idx ごとに独立に append されるため、
+  「prelude 後のキャッシュを毎イテレーション clone → mid 層が append → 最後に coda 層が append」で
+  suffix 用の全層キャッシュが自然に完成する。
+- `ℓ_s = 0, ℓ_e = L, mode = add_final_norm` は既存の全層ループと数値的に一致する
+  (等価性テストに使う)。
+
+### 注入モード (`mid_loop_injection_mode`)
+
+残差ストリームへ直接足すためスケールの扱いが本質的な設計判断になる。以下を切り替え可能にする。
+
+| モード | 式 | 備考 |
+| --- | --- | --- |
+| `add` | `h_pre + h_rec` | 生の残差同士の加算。イテレーションごとに残差ノルムが伸びる |
+| `add_norm` (デフォルト) | `h_pre + RMSNorm_new(h_rec)` | 新規の学習可能 RMSNorm (gain 初期値 1)。スケールを有界化 |
+| `add_final_norm` | `h_pre + norm_final(h_rec)` | モデル自身の最終 norm を流用。`(0, L)` で既存実装と等価 |
+| `replace` | `h_rec` | 入力注入なしの純粋な再帰 (既存の `latent_injection_mode=replace` に対応) |
+
+T2MLR 流のゲート付き融合 `Φ(h, r)` は拡張候補として残す (未実装)。
+
+## 実装項目
+
+1. `scripts/lotus.py`
+   - `_run_layers(hidden, layer_start, layer_end, attention_mask, position_ids, past_len, cache)`:
+     Llama (`model.layers`, rotary, 4D causal mask) と GPT-2 (`transformer.h`, tuple cache) の両方で
+     レイヤー範囲を手動 forward する。マスクは `past_len` を明示して自前で作る
+     (`DynamicCache.get_seq_length()` は prelude 後に層 0 がループ領域分伸びているため使えない)。
+   - `_embed_to_residual`: Llama は恒等、GPT-2 は `drop(wte + wpe)`。
+   - `_readout(h)`: coda 層 + 最終 norm + lm_head → `OutputWrapper(logits, last_hidden_state, cache)`。
+   - `Lotus.__init__` に `loop_layer_start`, `loop_layer_end`, `mid_loop_injection_mode`,
+     `mid_loop_readout_every_iter` を追加。未指定なら既存の全層ループ (後方互換)。
+   - `forward` の Step 2/3 に中間層ループ分岐を追加。Step 4 以降 (suffix, loss) は共通。
+   - 非対応の組み合わせは assert で弾く: `sample_stages`, `freeze_supervised_blocks`,
+     `intermediate_loss_type=cosine` 以外は動くが、cosine / IA loss は per-iter readout を強制する。
+2. `scripts/run.py`, `scripts/eval.py`: 設定値のプラミング。
+3. `args/`: 例として GPT-2 / Llama-1B の中間層ループ設定を追加。
+4. `scripts/test_mid_loop.py`: ランダム初期化の小型 Llama / GPT-2 で
+   - `(0, L, add_final_norm)` と既存パスの logits / loss が一致すること
+   - 中間層設定で forward / backward / generate が通ること
+   - KV キャッシュ長が suffix と整合すること
+   を検証する。
+
+## アブレーション設計案
+
+T2MLR Table 11 に倣い、幅固定で位置を振る。Llama-3.2-1B (16 層) の例:
+
+| 設定 | ℓ_s | ℓ_e | ループ対象 |
+| --- | --- | --- | --- |
+| full (再現ベースライン) | 0 | 16 | 100% |
+| middle 50% | 4 | 12 | 50% |
+| middle 25% | 6 | 10 | 25% |
+| early 25% | 0 | 4 | 25% |
+| late 25% | 12 | 16 | 25% |
+
+GPT-2 (12 層) なら `(0,12)`, `(3,9)`, `(4,8)`, `(0,4)`, `(8,12)`。
+Llama-3.2-3B (28 層) なら `(0,28)`, `(7,21)`, `(10,17)`, `(0,7)`, `(21,28)`。
+
+各設定について `add_norm` を基本とし、余裕があれば `add` / `replace` も比較する。
+
+記録する指標:
+- GSM8K 精度 (既存の eval)
+- thought フェーズのレイテンシ (`model._last_timing["thought"]`)。
+  全層ループでは `(R+1)` 回の全層 pass、中間層ループでは `1 回の全層 pass + R 回の部分 pass` になるので
+  精度と同時に速度への影響も見る。
+
+## 実装状況 (2026-09-04)
+
+上記の実装項目 1〜4 は完了している。
+
+| ファイル | 内容 |
+| --- | --- |
+| `scripts/lotus.py` | `_run_layers` / `_mid_loop_readout` などの層範囲 forward、`forward` の中間層ループ分岐、`_RMSNorm` |
+| `scripts/run.py` | `loop_layer_start` / `loop_layer_end` / `mid_loop_injection_mode` / `mid_loop_readout_every_iter` を config から渡す |
+| `scripts/eval.py` | 同名の CLI 引数 (`--loop_layer_start` など) |
+| `args/gsm8k_lotus_gpt2_midloop.yaml` | GPT-2 の例 (層 [3, 9)) |
+| `args/gsm8k_lotus_llama1b_midloop.yaml` | Llama-3.2-1B の例 (層 [4, 12)) |
+| `scripts/test_mid_loop.py` | 等価性 / 参照実装との一致 / 学習・生成の動作テスト |
+
+検証結果:
+
+- `uv run python scripts/test_mid_loop.py`: Llama / GPT-2 × eager / sdpa の全ケースで合格。
+  `(0, L, add_final_norm)` は既存パスと logits・loss・生成トークンが完全一致 (max diff 0)。
+  中間層設定 4 種 × 注入モード 4 種はフック実装の参照と 2e-4 以内で一致。
+- GPT-2 実データのスモーク学習 (debug モード、stage 2、1 epoch、層 [3, 9)、`add_norm`) が
+  end-to-end で完走 (loss 4.9 → 1.1、eval loss / 生成も動作)。
+
+実行例:
+
+```bash
+# 学習 (GPT-2, 中間層ループ)
+CONFIG=args/gsm8k_lotus_gpt2_midloop.yaml NPROC_PER_NODE=2 bash launch_train.sh
+
+# 評価 (学習時と同じ層範囲 / 注入モードを指定すること)
+uv run python scripts/eval.py --model_id openai-community/gpt2 --checkpoint <ckpt> --fp32 \
+  --c_thought 13 --n_looped_iters 6 --loop_layer_start 3 --loop_layer_end 9 --mid_loop_injection_mode add_norm
+```
+
+次のステップ: 上のアブレーション格子に沿って設定ファイルを増やし、精度と thought レイテンシを記録する。
+
+## 注意点 / 既知の制約
+
+- `use_kv_cache=True` 前提 (既存実装も同じ assert がある)。
+- GPT-2 では埋め込み dropout の適用位置が既存実装と微妙に異なる (train モードのみ)。eval では等価。
+- `add_norm` は新規パラメータ `mid_loop_norm.weight` を持つ。既存チェックポイントの読み込みは
+  `strict=False` なので初期値 (1) のまま学習される。
+- `generate(output_embedding=True)` が返す埋め込みは、中間層ループでは注入後ではなく元の埋め込みになる。
+- FSDP は `LlamaDecoderLayer` 単位でラップされるため、層を個別に呼んでも問題ない。
+  ただし全ランクで同じ層列を同じ回数呼ぶ必要がある (現状の分岐は入力に依存しないので満たす)。

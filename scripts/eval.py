@@ -94,6 +94,13 @@ def main():
     parser.add_argument("--c_thought", type=int, default=25, help="Number of thought tokens per loop")
     parser.add_argument("--n_latent_override", type=int, default=None,
                         help="If set, use this exact number of latent positions in the input prefix (overrides n_looped_iters*c_thought).")
+    parser.add_argument("--loop_layer_start", type=int, default=None,
+                        help="Mid-layer loop: first layer of the recurrent block (must match training).")
+    parser.add_argument("--loop_layer_end", type=int, default=None,
+                        help="Mid-layer loop: one past the last layer of the recurrent block (must match training).")
+    parser.add_argument("--mid_loop_injection_mode", default="add_norm",
+                        choices=["add", "add_norm", "add_final_norm", "replace"],
+                        help="Mid-layer loop injection mode (must match training).")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--bf16", action="store_true", default=True)
@@ -174,7 +181,15 @@ def main():
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             c_thought=args.c_thought,
+            loop_layer_start=args.loop_layer_start,
+            loop_layer_end=args.loop_layer_end,
+            mid_loop_injection_mode=args.mid_loop_injection_mode,
         )
+        if model.mid_loop:
+            print(
+                f"Mid-layer loop enabled: layers [{model.loop_layer_start}, {model.loop_layer_end}) "
+                f"of {model._n_layers}, injection={model.mid_loop_injection_mode}"
+            )
 
         if saved_weights is not None:
             info = model.load_state_dict(saved_weights, strict=False)
