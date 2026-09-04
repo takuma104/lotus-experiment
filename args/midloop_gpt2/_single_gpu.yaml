@@ -7,3 +7,6 @@ grad_accum_steps: 8
 # Let a re-launch of the queue resume from the latest checkpoint_N (model +
 # optimizer + RNG) instead of restarting the 30-epoch run from scratch.
 allow_resume_from_checkpoint: True
+# Validation-loss pass keeps all per-iteration logits (eval mode), so a batch
+# of 128 at stage 6 would retain ~14 GB of logits alone; use small batches.
+eval_batch_size: 16

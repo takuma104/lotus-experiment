@@ -726,9 +726,14 @@ def main():
                 single_latent_token=getattr(configs, "single_latent_token", False),
             )
 
+            # Validation-loss batches run in eval mode, where Lotus keeps every
+            # loop iteration's logits (for generation analysis), so a full
+            # training-size batch can need far more memory than a training
+            # micro-batch. `eval_batch_size` (default: batch_size_training)
+            # bounds that; it only changes how the logged eval loss is averaged.
             valid_loss_dataloader = _make_loader(
                 dataset_loss_val,
-                batch_size=configs.batch_size_training,
+                batch_size=int(getattr(configs, "eval_batch_size", configs.batch_size_training)),
                 sampler=DistributedSampler(dataset_loss_val, shuffle=False),
             )
 
