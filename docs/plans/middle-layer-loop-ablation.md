@@ -180,3 +180,23 @@ uv run python scripts/eval.py --model_id openai-community/gpt2 --checkpoint <ckp
 debug モードでの stage-6 速度 (3013 step/epoch): 全層ループ 1.63 s/step (≈ 82 分/epoch)、
 [3, 9) ループ 1.07 s/step (≈ 54 分/epoch)。30 epoch のうち stage 6 が 24 epoch なので、
 全層ループ 1 本あたり ≈ 1.5 日、6 本の合計は ≈ 7 日程度の見込み。
+
+### 結果 1/6: `gsm-lotus-gpt2-full-legacy` (全層ループ、再現ベースライン) — 2026-09-06 完了
+
+学習 2026-09-04 19:14 → 09-06 10:05 (約 39 時間、うち 1 回の手動再起動)。stage 6 は約 1 時間/epoch。
+
+| 指標 | 値 | 論文 (Table 1, GPT-2 LOTUS) |
+| --- | --- | --- |
+| val best | 46.0% (epoch 27) | – |
+| val last (epoch 30) | 45.8% | – |
+| GSM8K test | **43.7%** (576/1319) | 44.1 ± 0.7 |
+| GSM-Hard | 9.9% (130/1319) | 9.5 ± 0.2 |
+| MultiArith | 91.1% (164/180) | 92.4 ± 1.4 |
+| SVAMP | 42.1% (421/1000) | 41.8 ± 0.9 |
+| OOD 平均 | 47.7 | 47.9 |
+| thought レイテンシ (GSM8K test) | 27.5 ms/例 (推論全体 38.8 ms/例) | – |
+| 学習ピークメモリ | 20.1 GB | – |
+
+論文の GPT-2 LOTUS と誤差範囲で一致しており、1 GPU + 勾配累積 (16 × 8) の設定で再現できている。
+validation 精度の推移: stage 0 で 41.4% → stage 1〜5 で 33〜36% に低下 → stage 6 (epoch 7 以降) で
+回復し epoch 13 以降は 41〜46% で推移。
