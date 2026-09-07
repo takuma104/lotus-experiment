@@ -2,8 +2,8 @@
 # Sequential single-GPU driver for the GPT-2 mid-layer-loop ablation grid
 # (docs/plans/middle-layer-loop-ablation.md). For every entry: train with
 # launch_train.sh (auto-resumes from outputs/<run>/checkpoint_N if present),
-# then evaluate checkpoint_final on GSM8K test and the three OOD sets with the
-# matching loop-range flags. Marker files under outputs/<run>/ make the script
+# then evaluate checkpoint_final (best val) and the last epoch checkpoint on
+# GSM8K test and the three OOD sets (scripts/eval_midloop_ckpt_gpt2.sh). Marker files under outputs/<run>/ make the script
 # idempotent: TRAIN_DONE skips training, DONE skips the whole entry.
 #
 #   nohup bash scripts/run_midloop_ablation_gpt2.sh > outputs/midloop_gpt2_queue.log 2>&1 &
@@ -14,18 +14,6 @@ cd "$(dirname "$0")/.."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-29531}"
-MODEL_ID="openai-community/gpt2"
-EVAL_COMMON=(--model_id "$MODEL_ID" --fp32 --n_looped_iters 6 --c_thought 13)
-
-# run-key -> extra eval.py flags (must mirror the training config)
-declare -A EVAL_FLAGS=(
-  ["full-legacy"]=""
-  ["mid3-9"]="--loop_layer_start 3 --loop_layer_end 9 --mid_loop_injection_mode add_norm"
-  ["mid4-8"]="--loop_layer_start 4 --loop_layer_end 8 --mid_loop_injection_mode add_norm"
-  ["early0-4"]="--loop_layer_start 0 --loop_layer_end 4 --mid_loop_injection_mode add_norm"
-  ["late8-12"]="--loop_layer_start 8 --loop_layer_end 12 --mid_loop_injection_mode add_norm"
-  ["full0-12"]="--loop_layer_start 0 --loop_layer_end 12 --mid_loop_injection_mode add_norm"
-)
 DEFAULT_RUNS="full-legacy mid3-9 mid4-8 early0-4 late8-12 full0-12"
 RUNS="${RUNS:-$DEFAULT_RUNS}"
 
@@ -61,16 +49,17 @@ for key in $RUNS; do
     continue
   fi
 
-  # shellcheck disable=SC2206
-  extra=(${EVAL_FLAGS[$key]})
-  log "$name: eval gsm8k"
-  uv run python scripts/eval.py --checkpoint "$out/checkpoint_final" "${EVAL_COMMON[@]}" "${extra[@]}" \
-    --datasets gsm8k --save_preds "$out/preds_gsm8k.json" --save_results "$out/results_gsm8k.json" \
-    > "$out/eval_gsm8k.log" 2>&1 || log "$name: gsm8k eval FAILED (see $out/eval_gsm8k.log)"
-  log "$name: eval OOD (gsm-hard multi-arith svamp)"
-  uv run python scripts/eval.py --checkpoint "$out/checkpoint_final" "${EVAL_COMMON[@]}" "${extra[@]}" \
-    --datasets gsm-hard multi-arith svamp --save_preds "$out/preds_ood.json" --save_results "$out/results_ood.json" \
-    > "$out/eval_ood.log" 2>&1 || log "$name: OOD eval FAILED (see $out/eval_ood.log)"
+  # checkpoint_final = best validation accuracy (the paper's selection rule)
+  log "$name: eval checkpoint_final (best val)"
+  bash scripts/eval_midloop_ckpt_gpt2.sh "$key" "$out/checkpoint_final" "" || log "$name: checkpoint_final eval FAILED"
+  # Also evaluate the last epoch checkpoint: when a variant never beats its
+  # stage-0 (no-latent) validation accuracy, checkpoint_final is the stage-0
+  # model and would not measure the looped variant at all.
+  last_ckpt=$(ls -d "$out"/checkpoint_[0-9]* 2>/dev/null | sort -t_ -k2 -n | tail -1)
+  if [[ -n "$last_ckpt" ]]; then
+    log "$name: eval $(basename "$last_ckpt") (last epoch)"
+    bash scripts/eval_midloop_ckpt_gpt2.sh "$key" "$last_ckpt" "_last" || log "$name: last-checkpoint eval FAILED"
+  fi
 
   if [[ -f "$out/results_gsm8k.json" ]]; then
     touch "$out/DONE"

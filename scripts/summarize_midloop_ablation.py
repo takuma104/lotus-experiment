@@ -63,6 +63,8 @@ def main():
         tr = parse_train_log(os.path.join(d, "train.log"))
         g = load_results(os.path.join(d, "results_gsm8k.json")).get("gsm8k", {})
         ood = load_results(os.path.join(d, "results_ood.json"))
+        g_last = load_results(os.path.join(d, "results_gsm8k_last.json")).get("gsm8k", {})
+        ood_last = load_results(os.path.join(d, "results_ood_last.json"))
         status = "DONE" if os.path.exists(os.path.join(d, "DONE")) else (
             "trained" if os.path.exists(os.path.join(d, "TRAIN_DONE")) else "running/pending")
         best = max(tr["val_accs"]) if tr["val_accs"] else None
@@ -72,6 +74,8 @@ def main():
             thought_ms = 1000 * g["thought_time"] / g["total"]
         ood_accs = [ood.get(k, {}).get("accuracy") for k in ("gsm-hard", "multi-arith", "svamp")]
         ood_avg = None if any(a is None for a in ood_accs) else sum(ood_accs) / 3
+        ood_last_accs = [ood_last.get(k, {}).get("accuracy") for k in ("gsm-hard", "multi-arith", "svamp")]
+        ood_last_avg = None if any(a is None for a in ood_last_accs) else sum(ood_last_accs) / 3
         rows.append({
             "run": name.replace("gsm-lotus-gpt2-", ""),
             "status": status,
@@ -80,17 +84,19 @@ def main():
             "test": g.get("accuracy"),
             "gsm_hard": ood_accs[0], "multi_arith": ood_accs[1], "svamp": ood_accs[2], "ood_avg": ood_avg,
             "thought_ms": thought_ms,
+            "test_last": g_last.get("accuracy"), "ood_last_avg": ood_last_avg,
             "peak_mem": tr["peak_mem_gb"],
         })
 
-    hdr = "| run | status | epochs | val best | val last | GSM8K test | GSM-Hard | MultiArith | SVAMP | OOD avg | thought ms/ex | peak GB |"
+    hdr = "| run | status | epochs | val best | val last | GSM8K test | GSM-Hard | MultiArith | SVAMP | OOD avg | test (last ep) | OOD avg (last ep) | thought ms/ex | peak GB |"
     print(hdr)
     print("|" + "---|" * (hdr.count("|") - 1))
     for r in rows:
         print(
             f"| {r['run']} | {r['status']} | {r['epochs']} | {fmt_pct(r['val_best'])} | {fmt_pct(r['val_last'])} | "
             f"{fmt_pct(r['test'])} | {fmt_pct(r['gsm_hard'])} | {fmt_pct(r['multi_arith'])} | {fmt_pct(r['svamp'])} | "
-            f"{fmt_pct(r['ood_avg'])} | {'-' if r['thought_ms'] is None else f'{r['thought_ms']:.1f}'} | "
+            f"{fmt_pct(r['ood_avg'])} | {fmt_pct(r['test_last'])} | {fmt_pct(r['ood_last_avg'])} | "
+            f"{'-' if r['thought_ms'] is None else f'{r['thought_ms']:.1f}'} | "
             f"{'-' if r['peak_mem'] is None else f'{r['peak_mem']:.1f}'} |"
         )
 
