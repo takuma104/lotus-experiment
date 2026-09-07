@@ -200,3 +200,28 @@ debug モードでの stage-6 速度 (3013 step/epoch): 全層ループ 1.63 s/s
 論文の GPT-2 LOTUS と誤差範囲で一致しており、1 GPU + 勾配累積 (16 × 8) の設定で再現できている。
 validation 精度の推移: stage 0 で 41.4% → stage 1〜5 で 33〜36% に低下 → stage 6 (epoch 7 以降) で
 回復し epoch 13 以降は 41〜46% で推移。
+
+### 結果 2/6: `gsm-lotus-gpt2-mid3-9` (層 [3, 9) ループ, add_norm) — 2026-09-07 完了
+
+学習 2026-09-06 10:08 → 09-07 12:25 (約 26 時間、stage 6 は約 40 分/epoch)。
+
+validation 精度の推移: stage 0 で 41.4% (ベースラインと同一) → stage 1〜5 で 19.8〜30.6% →
+stage 6 (epoch 7〜30) では 22.4〜28.4% の帯で横ばい (最終 epoch 25.6%)。
+ベースラインの同時期 (41〜46%) に遠く及ばない。
+**stage 0 の 41.4% を一度も上回らなかったため、best-val 選択の `checkpoint_final` は latent 学習前 (epoch 1) の重み**になっており、
+それを 78 latent + R=6 で評価した値は無意味 (GSM8K 3.6%)。
+そこで各 run について最終 epoch のチェックポイントも評価するようにした (`results_*_last.json`、`scripts/eval_midloop_ckpt_gpt2.sh`)。
+
+| チェックポイント | GSM8K test | GSM-Hard | MultiArith | SVAMP | OOD 平均 |
+| --- | --- | --- | --- | --- | --- |
+| mid3-9 checkpoint_final (= epoch 1, stage 0 重み) | 3.6% (47/1319) | 0.9 | 10.6 | 3.9 | 5.1 |
+| mid3-9 checkpoint_30 (最終 epoch) | 28.8% (380/1319) | 6.4 | 52.8 | 29.0 | 29.4 |
+| 参考: full-legacy checkpoint_30 (最終 epoch) | 43.6% (575/1319) | 9.5 | 89.4 | 41.8 | 46.9 |
+
+学習ピークメモリ 14.8 GB (全層ループ 20.1 GB)。thought レイテンシは同時に走っている次の学習ジョブと GPU を共有した状態で
+計測したため参考にならない (checkpoint_final 評価 17.1 ms/例、checkpoint_30 評価 33.3 ms/例)。
+全 run 終了後に GPU 空き状態でレイテンシを再計測する。
+
+生成と teacher-forced forward の整合性は `scripts/check_gen_vs_forward.py` で確認済み (stage 4 の checkpoint で
+first-token logits 一致 100/100、teacher-forced 26% vs 生成 20%) なので、推論経路のバグではなく
+「層 [3, 9) のみを add_norm 注入でループする構成が GPT-2 では学習しにくい」という結果と解釈する。
