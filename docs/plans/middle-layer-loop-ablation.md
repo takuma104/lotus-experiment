@@ -225,3 +225,20 @@ stage 6 (epoch 7〜30) では 22.4〜28.4% の帯で横ばい (最終 epoch 25.6
 生成と teacher-forced forward の整合性は `scripts/check_gen_vs_forward.py` で確認済み (stage 4 の checkpoint で
 first-token logits 一致 100/100、teacher-forced 26% vs 生成 20%) なので、推論経路のバグではなく
 「層 [3, 9) のみを add_norm 注入でループする構成が GPT-2 では学習しにくい」という結果と解釈する。
+
+### 結果 3/6: `gsm-lotus-gpt2-mid4-8` (層 [4, 8) ループ, add_norm) — 2026-09-08 完了
+
+学習 2026-09-07 12:30 → 09-08 11:11 (約 23 時間、stage 6 は約 35 分/epoch)。
+
+validation 精度の推移: stage 0 で 41.4% → stage 1〜5 で 20.0〜32.0% →
+stage 6 では 23.2〜28.4% (最終 epoch 26.2%)。mid3-9 とほぼ同じ曲線で、
+ループ幅を 50% → 25% に狭めても変化なし。stage 0 を上回らなかったため `checkpoint_final` は epoch 1 の重み。
+
+| チェックポイント | GSM8K test | GSM-Hard | MultiArith | SVAMP | OOD 平均 |
+| --- | --- | --- | --- | --- | --- |
+| mid4-8 checkpoint_final (= epoch 1, stage 0 重み) | 3.8% (50/1319) | 1.1 | 11.7 | 4.0 | 5.6 |
+| mid4-8 checkpoint_30 (最終 epoch) | 26.9% (355/1319) | 6.6 | 43.3 | 27.0 | 25.6 |
+| 参考: mid3-9 checkpoint_30 | 28.8% (380/1319) | 6.4 | 52.8 | 29.0 | 29.4 |
+| 参考: full-legacy checkpoint_30 | 43.6% (575/1319) | 9.5 | 89.4 | 41.8 | 46.9 |
+
+学習ピークメモリ 13.3 GB。学習済み `mid_loop_norm.weight` は 0.76〜1.16 (初期値 1) で、mid3-9 同様ほとんど動いていない。
