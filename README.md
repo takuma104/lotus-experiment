@@ -223,7 +223,8 @@ By default LOTUS loops the *whole* backbone. This fork adds an ablation that rec
 contiguous layer range `[loop_layer_start, loop_layer_end)` (prelude layers run once, the recurrent
 block runs `R+1` times, coda layers + LM head run once after the loop), following the
 "middle-layer recurrence" idea of T2MLR. See
-[docs/plans/middle-layer-loop-ablation.md](docs/plans/middle-layer-loop-ablation.md) for the design.
+[docs/plans/middle-layer-loop-ablation.md](docs/plans/middle-layer-loop-ablation.md) for the design and the
+GPT-2 results (partial-layer loops collapse to 25-29% GSM8K vs 43.6% for the full loop; add_norm injection itself is fine).
 
 Config keys (training) / CLI flags (`eval.py`):
 
@@ -242,6 +243,9 @@ CONFIG=args/gsm8k_lotus_gpt2_midloop.yaml NPROC_PER_NODE=2 bash launch_train.sh
 python scripts/eval.py --checkpoint ./outputs/gsm-lotus-gpt2-mid3-9/checkpoint_final \
   --model_id openai-community/gpt2 --datasets gsm8k --fp32 \
   --n_looped_iters 6 --c_thought 13 --loop_layer_start 3 --loop_layer_end 9
+
+# Idle-GPU latency re-measurement of finished runs (results_gsm8k_idle.json per run)
+bash scripts/measure_midloop_latency_gpt2.sh
 
 # Correctness tests (tiny random Llama / GPT-2; checks equivalence with the full-model loop)
 python scripts/test_mid_loop.py
